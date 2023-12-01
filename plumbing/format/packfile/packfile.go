@@ -114,6 +114,18 @@ func (p *Packfile) GetSizeByOffset(o int64) (size int64, err error) {
 	return p.getObjectSize(h)
 }
 
+func (p *Packfile) ObjectsWithPrefix(prefix []byte, typ plumbing.ObjectType) (storer.EncodedObjectIter, error) {
+	entries, err := p.EntriesWithPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+	return &objectIter{
+		p:    p,
+		typ:  typ,
+		iter: entries,
+	}, nil
+}
+
 func (p *Packfile) objectHeaderAtOffset(offset int64) (*ObjectHeader, error) {
 	h, err := p.s.SeekObjectHeader(offset)
 	p.s.pendingObject = nil

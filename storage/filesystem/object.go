@@ -553,46 +553,27 @@ func (s *ObjectStorage) findObjectInPackfile(h plumbing.Hash) (plumbing.Hash, pl
 // HashesWithPrefix returns all objects with a hash that starts with a prefix by searching for
 // them in the packfile and the git object directories.
 func (s *ObjectStorage) HashesWithPrefix(prefix []byte) ([]plumbing.Hash, error) {
-	hashes, err := s.dir.ObjectsWithPrefix(prefix)
+	ei, err := s.IterEncodedObjectsPrefix(plumbing.AnyObject, prefix)
 	if err != nil {
 		return nil, err
 	}
 
-	seen := hashListAsMap(hashes)
-
-	// TODO: This could be faster with some idxfile changes,
-	// or diving into the packfile.
-	if err := s.requireIndex(); err != nil {
-		return nil, err
-	}
-	for _, index := range s.index {
-		ei, err := index.Entries()
+	var hashes []plumbing.Hash
+	for {
+		obj, err := ei.Next()
 		if err != nil {
-			return nil, err
-		}
-		for {
-			e, err := ei.Next()
 			if err == io.EOF {
 				break
-			} else if err != nil {
-				return nil, err
 			}
-			if bytes.HasPrefix(e.Hash[:], prefix) {
-				if _, ok := seen[e.Hash]; ok {
-					continue
-				}
-				hashes = append(hashes, e.Hash)
-			}
+			return nil, err
 		}
-		ei.Close()
+		hashes = append(hashes, obj.Hash())
 	}
 
 	return hashes, nil
 }
 
-// IterEncodedObjects returns an iterator for all the objects in the packfile
-// with the given type.
-func (s *ObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
+func (s *ObjectStorage) iterEncodedObjectsPrefix(t plumbing.ObjectType, prefix []byte) (storer.EncodedObjectIter, error) {
 	objects, err := s.dir.Objects()
 	if err != nil {
 		return nil, err
@@ -601,11 +582,11 @@ func (s *ObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (storer.Encode
 	seen := make(map[plumbing.Hash]struct{})
 	var iters []storer.EncodedObjectIter
 	if len(objects) != 0 {
-		iters = append(iters, &objectsIter{s: s, t: t, h: objects})
+		iters = append(iters, &objectsIter{s: s, t: t, h: objects, p: prefix})
 		seen = hashListAsMap(objects)
 	}
 
-	packi, err := s.buildPackfileIters(t, seen)
+	packi, err := s.buildPackfileIters(t, seen, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -614,9 +595,20 @@ func (s *ObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (storer.Encode
 	return storer.NewMultiEncodedObjectIter(iters), nil
 }
 
+func (s *ObjectStorage) IterEncodedObjectsPrefix(t plumbing.ObjectType, prefix []byte) (storer.EncodedObjectIter, error) {
+	return s.iterEncodedObjectsPrefix(t, prefix)
+}
+
+// IterEncodedObjects returns an iterator for all the objects in the packfile
+// with the given type.
+func (s *ObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
+	return s.iterEncodedObjectsPrefix(t, []byte{})
+}
+
 func (s *ObjectStorage) buildPackfileIters(
 	t plumbing.ObjectType,
 	seen map[plumbing.Hash]struct{},
+	prefix []byte,
 ) (storer.EncodedObjectIter, error) {
 	if err := s.requireIndex(); err != nil {
 		return nil, err
@@ -637,6 +629,7 @@ func (s *ObjectStorage) buildPackfileIters(
 				s.dir.Fs(), pack, t, seen, s.index[h],
 				s.objectCache, s.options.KeepDescriptors,
 				s.options.LargeObjectThreshold,
+				prefix,
 			)
 		},
 	}, nil
@@ -727,6 +720,7 @@ func NewPackfileIter(
 	t plumbing.ObjectType,
 	keepPack bool,
 	largeObjectThreshold int64,
+	prefix []byte,
 ) (storer.EncodedObjectIter, error) {
 	idx := idxfile.NewMemoryIndex()
 	if err := idxfile.NewDecoder(idxFile).Decode(idx); err != nil {
@@ -738,7 +732,7 @@ func NewPackfileIter(
 	}
 
 	seen := make(map[plumbing.Hash]struct{})
-	return newPackfileIter(fs, f, t, seen, idx, nil, keepPack, largeObjectThreshold)
+	return newPackfileIter(fs, f, t, seen, idx, nil, keepPack, largeObjectThreshold, prefix)
 }
 
 func newPackfileIter(
@@ -750,17 +744,26 @@ func newPackfileIter(
 	cache cache.Object,
 	keepPack bool,
 	largeObjectThreshold int64,
+	prefix []byte,
 ) (storer.EncodedObjectIter, error) {
 	var p *packfile.Packfile
+	var iter storer.EncodedObjectIter
+	var err error
 	if cache != nil {
 		p = packfile.NewPackfileWithCache(index, fs, f, cache, largeObjectThreshold)
 	} else {
 		p = packfile.NewPackfile(index, fs, f, largeObjectThreshold)
 	}
-
-	iter, err := p.GetByType(t)
-	if err != nil {
-		return nil, err
+	if len(prefix) > 0 {
+		iter, err = p.ObjectsWithPrefix(prefix, t)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		iter, err = p.GetByType(t)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &packfileIter{
@@ -814,11 +817,17 @@ type objectsIter struct {
 	s *ObjectStorage
 	t plumbing.ObjectType
 	h []plumbing.Hash
+	p []byte
 }
 
 func (iter *objectsIter) Next() (plumbing.EncodedObject, error) {
 	if len(iter.h) == 0 {
 		return nil, io.EOF
+	}
+
+	if len(iter.p) > 0 && !bytes.HasPrefix(iter.h[0][:], iter.p) {
+		iter.h = iter.h[1:]
+		return iter.Next()
 	}
 
 	obj, err := iter.s.getFromUnpacked(iter.h[0])

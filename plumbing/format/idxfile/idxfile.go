@@ -2,6 +2,7 @@ package idxfile
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"sort"
 
@@ -40,6 +41,9 @@ type Index interface {
 	// EntriesByOffset returns an iterator to retrieve all index entries ordered
 	// by offset.
 	EntriesByOffset() (EntryIter, error)
+	// EntriesWithPrefix returns an iterator to retrieve all index entries with
+	// the given prefix
+	EntriesWithPrefix(prefix []byte) (EntryIter, error)
 }
 
 // MemoryIndex is the in memory representation of an idx file.
@@ -66,6 +70,35 @@ var _ Index = (*MemoryIndex)(nil)
 // NewMemoryIndex returns an instance of a new MemoryIndex.
 func NewMemoryIndex() *MemoryIndex {
 	return &MemoryIndex{}
+}
+
+func (idx *MemoryIndex) findHashPrefix(prefix []byte) (int, bool) {
+	k := idx.FanoutMapping[prefix[0]]
+	if k == noMapping {
+		return 0, false
+	}
+
+	if len(idx.Names) <= k {
+		return 0, false
+	}
+
+	data := idx.Names[k]
+	high := uint64(len(idx.Offset32[k])) >> 2
+	if high == 0 {
+		return 0, false
+	}
+
+	result := sort.Search(int(high), func(i int) bool {
+		offset := uint64(i) * objectIDLength
+		cmp := bytes.Compare(prefix, data[offset:offset+objectIDLength])
+		return cmp <= 0
+	})
+
+	if bytes.HasPrefix(data[result*objectIDLength:], prefix) {
+		return result, true
+	}
+
+	return 0, false
 }
 
 func (idx *MemoryIndex) findHashIndex(h plumbing.Hash) (int, bool) {
@@ -135,6 +168,52 @@ func (idx *MemoryIndex) FindOffset(h plumbing.Hash) (int64, error) {
 	}
 
 	return int64(offset), nil
+}
+
+type idxFilePrefixIter struct {
+	idxfileEntryIter
+	prefix []byte
+}
+
+func (i *idxFilePrefixIter) Next() (*Entry, error) {
+	entry, err := i.idxfileEntryIter.Next()
+	if err != nil {
+		return nil, err
+	}
+	if !bytes.HasPrefix(entry.Hash[:], i.prefix[:]) {
+		return nil, io.EOF
+	}
+	return entry, nil
+}
+
+func (i *idxFilePrefixIter) Close() error {
+	return i.idxfileEntryIter.Close()
+}
+
+// FindOffsets implements the Index interface.
+func (idx *MemoryIndex) EntriesWithPrefix(prefix []byte) (EntryIter, error) {
+	if len(prefix) == 0 {
+		return nil, fmt.Errorf("prefix must not be empty")
+	}
+	if len(idx.FanoutMapping) <= int(prefix[0]) {
+		return nil, plumbing.ErrObjectNotFound
+	}
+
+	k := idx.FanoutMapping[prefix[0]]
+	index, ok := idx.findHashPrefix(prefix)
+	if !ok {
+		return nil, plumbing.ErrObjectNotFound
+	}
+
+	return &idxFilePrefixIter{
+		prefix: prefix,
+		idxfileEntryIter: idxfileEntryIter{
+			idx:         idx,
+			total:       0,
+			firstLevel:  k,
+			secondLevel: index,
+		},
+	}, nil
 }
 
 const isO64Mask = uint64(1) << 31
@@ -264,6 +343,14 @@ func (idx *MemoryIndex) EntriesByOffset() (EntryIter, error) {
 type EntryIter interface {
 	// Next returns the next entry in the packfile index.
 	Next() (*Entry, error)
+	// Close closes the iterator.
+	Close() error
+}
+
+// OffsetIter is an iterator that will return the offsets in a packfile index.
+type OffsetIter interface {
+	// Next returns the next entry in the packfile index.
+	Next() (int64, error)
 	// Close closes the iterator.
 	Close() error
 }
